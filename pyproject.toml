@@ -1,6 +1,6 @@
 [project]
 name = "stl-find-ball"
-version = "0.1.1"
+version = "0.1.2"
 description = "find ball structure in a certain .stl model."
 authors = [
     {name = "GGN_2015",email = "neko@jlulug.org"}

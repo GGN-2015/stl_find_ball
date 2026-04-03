@@ -57,9 +57,9 @@ def locate_sphere_in_stl(
 
         # Check if points lie on a spherical surface
         if np.max(dists) - np.min(dists) <= distance_tolerance:
-            spheres.append((center, radius))
+            spheres.append(((float(center[0]), float(center[1]), float(center[2])), float(radius)))
             checked_points.update(neighbors)
-            tqdm.write(f"Sphere detected: Center {center.round(3)} Radius {radius:.3f}")
+            tqdm.write(f"Sphere detected: Center {center} Radius {radius}")
     
     print(f"\n===== Detection Finished: {len(spheres)} spheres found =====")
     return spheres

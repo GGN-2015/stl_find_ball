@@ -11,6 +11,7 @@ pip install stl_find_ball
 
 ```python
 from stl_find_ball import locate_sphere_in_stl, vtk_visualization
+import json
 
 # input your stl filepath
 STL_FILE = "BONE-1.stl"
@@ -31,4 +32,9 @@ vtk_visualization(
     stl_path=STL_FILE, 
     spheres=detected_spheres
 )
+
+# Output json form data
+with open(STL_FILE[:-4] + ".json", "w") as fp:
+    fp.write(json.dumps(detected_spheres, indent=4))
+
 ```
