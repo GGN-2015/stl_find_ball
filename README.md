@@ -10,6 +10,7 @@ pip install stl_find_ball
 ## Usage
 
 ```python
+from stl_find_ball import locate_sphere_in_stl, vtk_visualization
 
 # input your stl filepath
 STL_FILE = "BONE-1.stl"
