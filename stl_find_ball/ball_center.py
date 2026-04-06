@@ -4,77 +4,169 @@ import trimesh
 from tqdm import tqdm
 import vtk
 
+# -------------------
+# Curvature Radius Calculation
+# -------------------
+def estimate_curvature_radius(points, center_idx=0):
+    pts = np.asarray(points, dtype=np.float64)
+    p0 = pts[center_idx:center_idx+1]
+    neighbors = np.delete(pts, center_idx, axis=0)
+    q = neighbors - p0
+    cov = q.T @ q / q.shape[0]
+    eig_vals, eig_vecs = np.linalg.eigh(cov)
+    n = eig_vecs[:, 0]
+
+    if np.abs(n[0]) < 0.9:
+        u = np.cross(n, [1,0,0])
+    else:
+        u = np.cross(n, [0,1,0])
+    u /= np.linalg.norm(u)
+    v = np.cross(n, u)
+
+    u_coords = q @ u
+    v_coords = q @ v
+    z_coords = q @ n
+
+    A = np.column_stack([u_coords**2, u_coords*v_coords, v_coords**2])
+    z = z_coords
+    abc, *_ = np.linalg.lstsq(A, z, rcond=None)
+    a, b, c = abc
+
+    S = np.array([[2*a, b], [b, 2*c]])
+    k1, k2 = np.linalg.eigvalsh(S)
+    eps = 1e-12
+    R1 = 1.0 / (np.abs(k1) + eps)
+    R2 = 1.0 / (np.abs(k2) + eps)
+    R_mean = 2.0 / (np.abs(k1) + np.abs(k2) + eps)
+    return k1, k2, R1, R2, R_mean
+
+# -------------------
+# Union-Find Data Structure
+# -------------------
+class UnionFind:
+    def __init__(self, size):
+        self.parent = np.arange(size)
+    def find(self, x):
+        while self.parent[x] != x:
+            self.parent[x] = self.parent[self.parent[x]]
+            x = self.parent[x]
+        return x
+    def union(self, x, y):
+        fx, fy = self.find(x), self.find(y)
+        if fx != fy:
+            self.parent[fy] = fx
+
+# -------------------
+# Core Function: Remove small spheres contained in larger ones
+# -------------------
 def locate_sphere_in_stl(
-        stl_path:str, 
-        alpha:float, 
-        distance_tolerance=None) -> list[tuple[tuple[float, ...], float]]:
-    """
-    Detect spheres in STL model and visualize using VTK
-    """
-    if distance_tolerance is None:
-        distance_tolerance = alpha / 20
-        
-    # Load STL model
-    print("===== Loading STL Model =====")
+    stl_path: str,
+    k: int = 20,
+    radius_rtol: float = 0.1,
+    dist_tol_ratio: float = 0.1,
+    min_cluster_size: int = 15
+):
+    # Load mesh model
     mesh = trimesh.load(stl_path)
-    vertices = mesh.vertices # type:ignore
-    unique_vertices = np.unique(vertices, axis=0)
+    pts = np.unique(mesh.vertices, axis=0).astype(np.float32)
+    n = len(pts)
+    print(f"Number of vertices: {n}")
 
-    print(f"Total original vertices: {len(vertices)}")
-    print(f"Total unique vertices: {len(unique_vertices)}")
+    # Build KDTree and search neighbors
+    print("Building KDTree...")
+    kdt = KDTree(pts)
+    dists, indices = kdt.query(pts, k=k)
 
-    # Calculate coordinate ranges
-    x_min, y_min, z_min = np.min(unique_vertices, axis=0)
-    x_max, y_max, z_max = np.max(unique_vertices, axis=0)
-    print(f"\n===== Coordinate Ranges =====")
-    print(f"X: [{x_min:.2f}, {x_max:.2f}]")
-    print(f"Y: [{y_min:.2f}, {y_max:.2f}]")
-    print(f"Z: [{z_min:.2f}, {z_max:.2f}]")
+    # Compute curvature radius for each point
+    print("Calculating curvature radii...")
+    radii = np.zeros(n, dtype=np.float32)
+    for i in tqdm(range(n)):
+        nb_pts = pts[indices[i]]
+        *_, R_mean = estimate_curvature_radius(nb_pts, center_idx=0)
+        radii[i] = R_mean
 
-    # Build KD-Tree for fast neighbor search
-    print(f"\n===== Building KD-Tree (alpha={alpha}) =====")
-    kdtree = KDTree(unique_vertices)
+    # Clustering with Union-Find
+    print("Union-Find clustering...")
+    uf = UnionFind(n)
+    for i in tqdm(range(n)):
+        for j in indices[i]:
+            if i == j: continue
+            if abs(radii[i] - radii[j]) / max(radii[i], radii[j], 1e-6) < radius_rtol:
+                uf.union(i, j)
 
-    checked_points = set()
+    # Extract connected components
+    print("Extracting connected components...")
+    components = {}
+    for i in range(n):
+        r = uf.find(i)
+        if r not in components:
+            components[r] = []
+        components[r].append(i)
+
+    # Validate and collect candidate spheres
+    print("Validating spherical surfaces...")
     spheres = []
-
-    # Start sphere detection with progress bar
-    print(f"\n===== Starting Sphere Detection =====")
-    for idx, point in enumerate(tqdm(unique_vertices, desc="Detection Progress")):
-        if idx in checked_points:
+    for comp in components.values():
+        if len(comp) < min_cluster_size:
             continue
+        cpts = pts[comp]
+        center = cpts.mean(axis=0)
+        d = np.linalg.norm(cpts - center, axis=1)
+        r = np.median(d)
+        tol = r * dist_tol_ratio
+        in_ratio = np.sum(np.abs(d - r) < tol) / len(cpts)
+        if in_ratio >= 0.7:
+            spheres.append((center, r))
 
-        neighbors = kdtree.query_ball_point(point, alpha)
-        neighbor_pts = unique_vertices[neighbors]
+    # ========================
+    # Remove small spheres inside larger ones
+    # ========================
+    if len(spheres) == 0:
+        return []
 
-        if len(neighbor_pts) < 10:
-            continue
+    # Sort spheres from largest to smallest radius
+    spheres.sort(key=lambda x: -x[1])
+    final_spheres = []
 
-        # Compute centroid as candidate sphere center
-        center = np.mean(neighbor_pts, axis=0)
-        dists = np.linalg.norm(neighbor_pts - center, axis=1)
-        radius = np.mean(dists)
+    for c, r in spheres:
+        keep = True
+        # Check against all larger spheres already kept
+        for fc, fr in final_spheres:
+            dist = np.linalg.norm(c - fc)
+            # If center is inside a larger sphere, discard this one
+            if dist < fr:
+                keep = False
+                break
+        if keep:
+            final_spheres.append((c, r))
 
-        # Check if points lie on a spherical surface
-        if np.max(dists) - np.min(dists) <= distance_tolerance:
-            spheres.append(((float(center[0]), float(center[1]), float(center[2])), float(radius)))
-            checked_points.update(neighbors)
-            tqdm.write(f"Sphere detected: Center {center} Radius {radius}")
-    
-    print(f"\n===== Detection Finished: {len(spheres)} spheres found =====")
-    return spheres
+    # ========================
+    # ✅ WRAPPER: Convert ALL numpy types to pure Python list / float
+    # ========================
+    pure_python_spheres = []
+    for center, radius in final_spheres:
+        # Convert numpy array -> Python list, numpy float -> Python float
+        center_list = [float(coord) for coord in center]
+        radius_float = float(radius)
+        pure_python_spheres.append((center_list, radius_float))
 
-def vtk_visualization(stl_path:str, spheres:list[tuple[tuple[float, ...], float]]):
-    # VTK 3D Visualization
-    print("\n===== Starting VTK Visualization =====")
-    renderWindow = vtk.vtkRenderWindow()
-    renderWindow.SetSize(1000, 800)
-    renderer = vtk.vtkRenderer()
-    renderWindow.AddRenderer(renderer)
-    interactor = vtk.vtkRenderWindowInteractor()
-    interactor.SetRenderWindow(renderWindow)
+    # Return pure Python types ONLY
+    print(f"\nOriginal detected spheres: {len(spheres)}")
+    print(f"Final spheres after filtering: {len(pure_python_spheres)}")
+    return pure_python_spheres
 
-    # Render STL model
+# -------------------
+# VTK 3D Visualization
+# -------------------
+def vtk_visualization(stl_path:str, spheres:list):
+    print("\nStarting VTK visualization...")
+    renWin = vtk.vtkRenderWindow()
+    renWin.SetSize(1000, 800)
+    ren = vtk.vtkRenderer()
+    renWin.AddRenderer(ren)
+    iren = vtk.vtkRenderWindowInteractor()
+    iren.SetRenderWindow(renWin)
+
     reader = vtk.vtkSTLReader()
     reader.SetFileName(stl_path)
     mapper = vtk.vtkPolyDataMapper()
@@ -82,42 +174,30 @@ def vtk_visualization(stl_path:str, spheres:list[tuple[tuple[float, ...], float]
     actor = vtk.vtkActor()
     actor.SetMapper(mapper)
     actor.GetProperty().SetOpacity(0.3)
-    actor.GetProperty().SetColor(0.7, 0.8, 1)
-    renderer.AddActor(actor)
+    actor.GetProperty().SetColor(0.7,0.8,1)
+    ren.AddActor(actor)
 
-    # Render detected spheres
-    for center, radius in spheres:
-        sphereSource = vtk.vtkSphereSource()
-        sphereSource.SetCenter(center[0], center[1], center[2])
-        sphereSource.SetRadius(radius)
-        sphereSource.SetThetaResolution(30)
-        sphereSource.SetPhiResolution(30)
+    for c, r in spheres:
+        src = vtk.vtkSphereSource()
+        src.SetCenter(*c)
+        src.SetRadius(r)
+        src.SetThetaResolution(30)
+        src.SetPhiResolution(30)
+        m = vtk.vtkPolyDataMapper()
+        m.SetInputConnection(src.GetOutputPort())
+        a = vtk.vtkActor()
+        a.SetMapper(m)
+        a.GetProperty().SetColor(1,0.2,0.2)
+        a.GetProperty().SetOpacity(0.6)
+        ren.AddActor(a)
 
-        sphereMapper = vtk.vtkPolyDataMapper()
-        sphereMapper.SetInputConnection(sphereSource.GetOutputPort())
-        sphereActor = vtk.vtkActor()
-        sphereActor.SetMapper(sphereMapper)
-        sphereActor.GetProperty().SetColor(1, 0.2, 0.2)
-        sphereActor.GetProperty().SetOpacity(0.6)
-        renderer.AddActor(sphereActor)
+    ren.SetBackground(0.1,0.1,0.1)
+    renWin.Render()
+    iren.Start()
 
-    # Window configuration
-    renderer.SetBackground(0.1, 0.1, 0.1)
-    renderWindow.SetWindowName("STL + Sphere Detection")
-    renderWindow.Render()
-    interactor.Start()
-
-# Main execution
+# -------------------
+# Main Execution
+# -------------------
 if __name__ == "__main__":
-    STL_FILE = "BONE-1.stl"
-    ALPHA = 0.01
-
-    detected_spheres = locate_sphere_in_stl(
-        stl_path=STL_FILE,
-        alpha=ALPHA
-    )
-
-    vtk_visualization(
-        stl_path=STL_FILE, 
-        spheres=detected_spheres
-    )
+    detected = locate_sphere_in_stl(stl_path="BONE-1.stl")
+    vtk_visualization("BONE-1.stl", detected)
