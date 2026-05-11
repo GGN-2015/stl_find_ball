@@ -1,6 +1,6 @@
 [project]
 name = "stl-find-ball"
-version = "0.1.3"
+version = "0.1.4"
 description = "find ball structure in a certain .stl model."
 authors = [
     {name = "GGN_2015",email = "neko@jlulug.org"}
@@ -13,7 +13,8 @@ dependencies = [
     "scipy",
     "trimesh",
     "tqdm",
-    "vtk"
+    "vtk",
+    "live_chrono"
 ]
 
 
